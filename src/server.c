@@ -11,115 +11,99 @@
 #include <netdb.h>
 #include <poll.h>
 
-#define BACKLOG_QUEUE 50
-#define PORT 8080
+#include "request.h"
+#include "server.h"
+#include "config.h"
 
-void polls_add(struct pollfd *polls[], int fd, int *len, int *cap) {
-    if (*len == *cap) {
-        *cap *= 2;
-        *polls = realloc(*polls, sizeof(**polls) * (*cap));
-    }
+#define SERVER_SOCKFD_IDX 0
 
-    (*polls)[*len].fd = fd;
-    (*polls)[*len].events = POLLIN;
+server_t *server_init() {
+    server_t *server = (server_t*)malloc(sizeof(server_t));
 
-    (*len)++;
+    server->sockfds_len = 1;
+    server->sockfds_cap = 100;
+
+    server->sockfds = malloc(sizeof(*server->sockfds) * server->sockfds_cap);
+
+    return server;
 }
 
-void polls_remove(struct pollfd *polls, int polls_i, int *len) {
-    polls[polls_i] = polls[*len-1];
-    (*len)--;
-}
+void server_start(server_t *server) {
+    if (!server) return;
 
-int main() {
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY); 
-    addr.sin_port = htons(PORT);
-    memset(&addr.sin_zero, 0, sizeof addr.sin_zero);
-    
-    int server_fd = socket(PF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
+    addr.sin_port = htons(SERVER_PORT);
+    memset(&addr.sin_zero, 0, sizeof(addr.sin_zero));
+
+    server->addr = addr;
+    server->fd = socket(PF_INET, SOCK_STREAM, 0);
+    if (server->fd < 0) {
         fprintf(stderr, "socket: %s\n", strerror(errno));
-        return EXIT_FAILURE;
+        exit(EXIT_FAILURE);
     }
 
-    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    server->sockfds[SERVER_SOCKFD_IDX].fd = server->fd;
+    server->sockfds[SERVER_SOCKFD_IDX].events = POLLIN;
+
+    if (bind(server->fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         fprintf(stderr, "bind: %s\n", strerror(errno));
-        return EXIT_FAILURE;
+        exit(EXIT_FAILURE);
     }
 
     int on = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) == -1) {
+    if (setsockopt(server->fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) == -1) {
         fprintf(stderr, "set socket option: %s\n", strerror(errno));
-        return EXIT_FAILURE;
+        exit(EXIT_FAILURE);
     }
 
-    if (listen(server_fd, BACKLOG_QUEUE) == -1) {
+    if (listen(server->fd, SERVER_BACKLOG) == -1) {
         fprintf(stderr, "listen: %s\n", strerror(errno));
-        return EXIT_FAILURE;
+        exit(EXIT_FAILURE);
     }
 
-    struct sockaddr_storage client_addr;
-    socklen_t client_addr_s = sizeof(client_addr);
+    fprintf(stdout, "Listening on %s:%d\n", SERVER_HOST, SERVER_PORT);
 
-    int polls_cap = 10;
-    int polls_len = 1;
-    struct pollfd *polls = malloc(sizeof(*polls) * polls_cap);
-
-    polls[0].fd = server_fd;
-    polls[0].events = POLLIN;
-
-    char recv_buf[1024];
-
-    printf("Server listening for incoming connections...\n");
-
-    // serving events on socketfd's here
     while(true) {
-        int events_count = poll(polls, polls_len, -1);
+        int events_count = poll(server->sockfds, server->sockfds_len, -1);
         if (events_count < 0) {
             fprintf(stderr, "poll: %s\n", strerror(errno));
             continue;
         }
 
-        if (polls[0].revents & POLLIN) {
-            int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_s);
+        // handle new connection
+        if (server->sockfds[SERVER_SOCKFD_IDX].revents | POLLIN) {
+            struct sockaddr_in client_addr;
+            socklen_t client_addr_s = sizeof(client_addr);
+
+            int client_fd = accept(server->fd, (struct sockaddr *)&client_addr, &client_addr_s);
             if (client_fd < 0) {
                 fprintf(stderr, "accept: %s\n", strerror(errno));
                 continue;
             }
 
-            polls_add(&polls, client_fd, &polls_len, &polls_cap);
-
-            printf("Client connected on socket %d\n", client_fd);
-
-            if (events_count == 1) continue;
-        }
-        
-        int events_processed = 0;
-
-        for (int i = 1; i < polls_cap; ++i) {
-            if (events_processed == events_count) {
-                break;
-            }
-
-            if (polls[i].revents & POLLIN) {
-                int recv_bytes = recv(polls[i].fd, recv_buf, sizeof(recv_buf), 0);
+            int recv_bytes = recv(client_fd, server->recv_buf, sizeof(server->recv_buf), 0);
                 if (recv_bytes <= 0) {
-                    close(polls[i].fd);
-
-                    printf("Client disconnected on socket %d\n", polls[i].fd);
-
-                    polls_remove(polls, i, &polls_len);
+                    close(client_fd);
                     continue;
                 }
 
-                printf("From client on socket %d: %s\n", polls[i].fd, recv_buf);
+                request_t req = request_parse(server->recv_buf);
+                
+                // handle request
 
-                memset(&recv_buf, 0, sizeof(recv_buf));
-            }
+                // reset receive buffer
+                memset(&server->recv_buf, 0, sizeof(server->recv_buf));            
+
+            if (events_count == 1) continue;
         }
     }
-    
-    return EXIT_SUCCESS;
+}
+
+void server_free(server_t *server) {
+    if (!server) return;
+
+    free(server->sockfds);
+    free(server);
 }
